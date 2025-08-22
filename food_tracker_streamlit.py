@@ -10,7 +10,7 @@
 # - Import a starter set of common Indian foods
 
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Tuple
 
 import pandas as pd
@@ -33,10 +33,69 @@ def get_conn():
     return conn
 
 
+def _table_has_column(conn: sqlite3.Connection, table: str, col: str) -> bool:
+    try:
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        cols = [r[1] for r in cur.fetchall()]
+        return col in cols
+    except Exception:
+        return False
+
+
+def _ensure_schema_with_set_null(conn: sqlite3.Connection):
+    # Recreate entries with ON DELETE SET NULL if needed.
+    cur = conn.cursor()
+    # Detect whether entries has ON DELETE SET NULL:
+    # Simpler approach: try to add a dummy FK behavior by recreating table if schema differs.
+    # We check if food_id is NOT NULL; we need it NULLABLE for SET NULL.
+    need_rebuild = False
+    try:
+        cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='entries'")
+        row = cur.fetchone()
+        if not row or ("ON DELETE SET NULL" not in row or "food_id INTEGER" not in row or "NOT NULL" in row.split("food_id")[1].split(",")):
+            need_rebuild = True
+    except Exception:
+        pass
+
+    if not need_rebuild:
+        return
+
+    # Rebuild entries table preserving data
+    cur.execute("BEGIN")
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS entries_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                d TEXT NOT NULL,              -- YYYY-MM-DD
+                food_id INTEGER,              -- nullable to allow SET NULL
+                qty REAL NOT NULL,            -- grams for per100g; count for piece/serving
+                note TEXT DEFAULT '',
+                FOREIGN KEY(food_id) REFERENCES foods(id) ON DELETE SET NULL
+            );
+        """)
+        # Copy if old table exists
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='entries'")
+        if cur.fetchone():
+            # Try to copy columns safely (food_id may exist)
+            cur.execute("PRAGMA table_info(entries)")
+            old_cols = [r[1] for r in cur.fetchall()]
+            common_cols = [c for c in ["id", "d", "food_id", "qty", "note"] if c in old_cols]
+            col_list = ",".join(common_cols)
+            cur.execute(f"INSERT INTO entries_new ({col_list}) SELECT {col_list} FROM entries")
+            cur.execute("DROP TABLE entries")
+        cur.execute("ALTER TABLE entries_new RENAME TO entries")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_entries_d ON entries(d)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_entries_food ON entries(food_id)")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        # If rebuild fails, keep existing table; deletion may still error if FK blocks.
+
+
 def init_db():
     with get_conn() as conn:
         cur = conn.cursor()
-        # Base tables (include fiber for fresh DBs)
+        # foods table
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS foods (
@@ -51,25 +110,31 @@ def init_db():
             );
             """
         )
+        # entries table (fresh installs already correct)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 d TEXT NOT NULL,              -- YYYY-MM-DD
-                food_id INTEGER NOT NULL,
-                qty REAL NOT NULL,            -- grams for per100g; count for piece/serving
+                food_id INTEGER,              -- nullable for SET NULL behavior
+                qty REAL NOT NULL,
                 note TEXT DEFAULT '',
-                FOREIGN KEY(food_id) REFERENCES foods(id)
+                FOREIGN KEY(food_id) REFERENCES foods(id) ON DELETE SET NULL
             );
             """
         )
+
         # Migration: add fiber to older DBs
         try:
-            cur.execute("ALTER TABLE foods ADD COLUMN fiber REAL NOT NULL DEFAULT 0;")
+            if not _table_has_column(conn, "foods", "fiber"):
+                cur.execute("ALTER TABLE foods ADD COLUMN fiber REAL NOT NULL DEFAULT 0;")
         except Exception:
             pass
 
-        # Helpful indexes
+        # Ensure entries has ON DELETE SET NULL and nullable food_id
+        _ensure_schema_with_set_null(conn)
+
+        # Indexes
         try:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_entries_d ON entries(d);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_entries_food ON entries(food_id);")
@@ -100,6 +165,8 @@ def add_food(name: str, unit: str, protein: float, carbs: float, fat: float, cal
 
 
 def delete_food(food_id: int):
+    # With ON DELETE SET NULL, this will succeed even if entries exist,
+    # setting their food_id to NULL and preserving history.
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute("DELETE FROM foods WHERE id=?", (food_id,))
@@ -131,11 +198,14 @@ def get_entries_by_date(d: date) -> pd.DataFrame:
     with get_conn() as conn:
         query = (
             """
-            SELECT e.id, e.d, f.name, f.unit, e.qty,
+            SELECT e.id, e.d,
+                   f.name AS name, f.unit AS unit,
+                   e.qty,
                    f.protein, f.carbs, f.fat, f.fiber, f.calories,
-                   e.note, f.id as food_id
+                   e.note,
+                   f.id as food_id
             FROM entries e
-            JOIN foods f ON e.food_id = f.id
+            LEFT JOIN foods f ON e.food_id = f.id
             WHERE e.d = ?
             ORDER BY e.id DESC
             """
@@ -148,11 +218,13 @@ def get_entries_between_dates(start_d: date, end_d: date) -> pd.DataFrame:
     with get_conn() as conn:
         query = (
             """
-            SELECT e.id, e.d, f.name, f.unit, e.qty,
+            SELECT e.id, e.d,
+                   f.name AS name, f.unit AS unit,
+                   e.qty,
                    f.protein, f.carbs, f.fat, f.fiber, f.calories,
                    e.note
             FROM entries e
-            JOIN foods f ON e.food_id = f.id
+            LEFT JOIN foods f ON e.food_id = f.id
             WHERE e.d BETWEEN ? AND ?
             ORDER BY e.d DESC, e.id DESC
             """
@@ -177,20 +249,29 @@ def calories_from_macros(p: float, c: float, f: float) -> float:
 
 
 def compute_row_totals(row: pd.Series) -> Tuple[float, float, float, float, float]:
-    unit = row["unit"]
-    qty = float(row["qty"]) if pd.notna(row["qty"]) else 0.0
-    p = float(row["protein"]) if pd.notna(row["protein"]) else 0.0
-    c = float(row["carbs"]) if pd.notna(row["carbs"]) else 0.0
-    f = float(row["fat"]) if pd.notna(row["fat"]) else 0.0
-    fi = float(row.get("fiber", 0.0)) if pd.notna(row.get("fiber", 0.0)) else 0.0
-    cal = float(row["calories"]) if pd.notna(row["calories"]) else 0.0
+    unit = row.get("unit", None)
+    qty = float(row["qty"]) if pd.notna(row.get("qty")) else 0.0
 
-    factor = qty / 100.0 if unit == "per100g" else qty
+    # Handle rows with missing food (after deletion) gracefully
+    p = float(row.get("protein", 0.0) or 0.0)
+    c = float(row.get("carbs", 0.0) or 0.0)
+    f = float(row.get("fat", 0.0) or 0.0)
+    fi = float(row.get("fiber", 0.0) or 0.0)
+    cal = float(row.get("calories", 0.0) or 0.0)
+
+    # If unit is missing (unknown food), treat factor as 0 to avoid accidental counting
+    if unit == "per100g":
+        factor = qty / 100.0
+    elif unit in ("per_piece", "per_serving"):
+        factor = qty
+    else:
+        factor = 0.0
+
     tp = p * factor
     tc = c * factor
     tf = f * factor
     tfi = fi * factor
-    tcal = cal * factor if cal > 0 else calories_from_macros(tp, tc, tf)
+    tcal = cal * factor if cal > 0 else calories_from_macros(tp, tc, tf) if factor > 0 else 0.0
     return tp, tc, tf, tfi, tcal
 
 
@@ -306,7 +387,7 @@ with log_tab:
             "fiber": float(chosen_food.get("fiber", 0.0)),
             "calories": float(chosen_food["calories"]),
         }])
-        tp, tc, tf, tfi, tcal = compute_row_totals(preview_df.iloc[0])
+        tp, tc, tf, tfi, tcal = compute_row_totals(preview_df.iloc)
         st.caption("This entry will add:")
         col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("Protein (g)", f"{tp:.1f}")
@@ -329,7 +410,12 @@ with log_tab:
         # Per‑row totals
         totals = day_df.apply(compute_row_totals, axis=1, result_type='expand')
         day_df[["total_protein", "total_carbs", "total_fat", "total_fiber", "total_calories"]] = totals
-        show_df = day_df[["name", "unit", "qty", "total_protein", "total_carbs", "total_fat", "total_fiber", "total_calories", "note", "id"]]
+        # Replace None names/units for deleted foods
+        safe_df = day_df.copy()
+        safe_df["name"] = safe_df["name"].fillna("Unknown food")
+        safe_df["unit"] = safe_df["unit"].fillna("unknown")
+
+        show_df = safe_df[["name", "unit", "qty", "total_protein", "total_carbs", "total_fat", "total_fiber", "total_calories", "note", "id"]]
         show_df = show_df.rename(columns={
             "name": "Food",
             "unit": "Unit",
@@ -412,7 +498,7 @@ with foods_tab:
             if st.button("🗑 Delete selected food"):
                 fid = int(foods_df.loc[foods_df["name"] == pick, "id"].iloc[0])
                 delete_food(fid)
-                st.success(f"Deleted {pick}. Note: existing entries referencing it will no longer show up in views.")
+                st.success(f"Deleted {pick}. Existing entries will show as 'Unknown food' and contribute 0 macros (since unit is unknown).")
 
 # --------------- Summary ---------------
 with summary_tab:
@@ -431,7 +517,7 @@ with summary_tab:
         col4.metric("Fiber", f"{FI:.1f} g")
         col5.metric("Calories", f"{K:.0f}")
 
-        # Macro ratio pie (Altair) - NOW includes Fiber as a slice
+        # Macro ratio pie (Altair) - includes Fiber
         pie_df = pd.DataFrame({
             "Macro": ["Protein", "Carbs", "Fat", "Fiber"],
             "Grams": [P, C, F, FI]
