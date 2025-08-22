@@ -1,6 +1,6 @@
 # food_tracker_streamlit.py
 # ---------------------------
-# Food Tracker with Fiber tracking
+# Added Fiber tracking (same as protein, carbs, fat)
 
 import sqlite3
 from datetime import date, timedelta
@@ -291,7 +291,5 @@ with history_tab:
             "total_fiber": "Fiber (g)",
             "total_calories": "Calories",
         }), use_container_width=True, hide_index=True)
-
-        # Charts
         st.line_chart(daily.set_index("d")["total_calories"], height=240)
         st.bar_chart(daily.set_index("d")["total_fiber"], height=240)
