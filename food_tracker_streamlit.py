@@ -11,7 +11,7 @@
 
 import sqlite3
 from datetime import date, datetime, timedelta
-from typing import List, Tuple
+from typing import Tuple
 
 import pandas as pd
 import streamlit as st
@@ -36,7 +36,7 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         cur = conn.cursor()
-        # Base tables (include fiber from start for fresh DBs)
+        # Base tables (include fiber for fresh DBs)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS foods (
@@ -63,7 +63,7 @@ def init_db():
             );
             """
         )
-        # Migration: add fiber if missing (for existing DBs created before fiber)
+        # Migration: add fiber to older DBs
         try:
             cur.execute("ALTER TABLE foods ADD COLUMN fiber REAL NOT NULL DEFAULT 0;")
         except Exception:
@@ -80,7 +80,6 @@ def init_db():
 
 
 def add_food(name: str, unit: str, protein: float, carbs: float, fat: float, calories: float, fiber: float = 0.0):
-    # Safe UPSERT that preserves existing IDs (no REPLACE)
     with get_conn() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -432,14 +431,14 @@ with summary_tab:
         col4.metric("Fiber", f"{FI:.1f} g")
         col5.metric("Calories", f"{K:.0f}")
 
-        # Macro ratio pie (Altair) - P/C/F only for clarity
+        # Macro ratio pie (Altair) - NOW includes Fiber as a slice
         pie_df = pd.DataFrame({
-            "Macro": ["Protein", "Carbs", "Fat"],
-            "Grams": [P, C, F]
+            "Macro": ["Protein", "Carbs", "Fat", "Fiber"],
+            "Grams": [P, C, F, FI]
         })
         try:
             import altair as alt
-            chart = alt.Chart(pie_df).mark_arc().encode(theta="Grams", color="Macro").properties(width=300, height=300)
+            chart = alt.Chart(pie_df).mark_arc().encode(theta="Grams", color="Macro").properties(width=320, height=320)
             st.altair_chart(chart, use_container_width=False)
         except Exception:
             st.write("Install altair for pie chart: pip install altair")
